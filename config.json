@@ -1,0 +1,10 @@
+{
+ "_説明": "plans の roles に、Patreon と FANBOX の連携で付くロールの名前をそのまま書く（大文字小文字・空白も同じに）。1 人が複数のロールを持つときは高い方のプランになる。optout_role は本人が付け外しする「パネルに載せない」ロールの名前。photo_slots は写真立ての枠の数（ワールド側の枠の数と合わせる）。",
+ "plans": [
+  {"plan": 1, "roles": ["（Patreon のプラン 1 のロール名）", "（FANBOX のプラン 1 のロール名）"]},
+  {"plan": 2, "roles": ["（Patreon のプラン 2 のロール名）", "（FANBOX のプラン 2 のロール名）"]},
+  {"plan": 3, "roles": ["（Patreon のプラン 3 のロール名）", "（FANBOX のプラン 3 のロール名）"]}
+ ],
+ "optout_role": "パネルに載せない",
+ "photo_slots": 10
+}

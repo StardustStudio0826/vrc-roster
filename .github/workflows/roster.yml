@@ -1,0 +1,76 @@
+# 1 時間ごとに Discord のロールから名簿を作り直し、変わっていたら GitHub Pages に出す。
+# 名簿は Git の記録には入れない（公開リポジトリの履歴に名前を残さないため）。Pages にだけ出す。
+# 設定や手直し（config.json・overrides.json・写真）を push したときと、手動実行でも動く。
+name: roster
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # 毎時 17 分（ちょうどの時刻は混むので避ける）
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - config.json
+      - overrides.json
+      - docs/**
+      - scripts/**
+      - .github/workflows/roster.yml
+
+permissions:
+  contents: write   # 定期実行を止めないための記録（heartbeat.txt）にだけ使う
+  pages: write
+  id-token: write
+
+concurrency:
+  group: roster
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Pages の準備
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: 名簿を作る
+        id: build
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
+        run: python3 scripts/build_roster.py --out site/roster.json --previous-url "${{ steps.pages.outputs.base_url }}/roster.json"
+
+      - name: 写真を名簿と一緒にまとめる
+        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        run: cp -r docs/. site/
+
+      - name: Pages に上げる中身をまとめる
+        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+      - name: Pages に出す
+        id: deploy
+        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        uses: actions/deploy-pages@v4
+
+      - name: 定期実行を止めないための記録
+        # 公開リポジトリの定期実行は、60 日動きが無いと GitHub に止められる。
+        # 25 日以上記録が無ければ、目印のファイルだけ書き換えて動きを作る。
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt $((25 * 86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            date -u +%Y-%m-%dT%H:%M:%SZ > heartbeat.txt
+            git add heartbeat.txt
+            git commit -m "定期実行を止めないための記録"
+            git push
+          fi
