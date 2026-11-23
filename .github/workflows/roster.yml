@@ -34,30 +34,43 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: 設定が済んでいるか確かめる
+        # config.json のロール名が仮（「（」で始まる）のままなら、何もせずに終わる（失敗のメールを出さない）。
+        id: cfg
+        run: |
+          if grep -q '"（' config.json; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "config.json のロール名がまだ仮なので、名簿は作りませんでした。" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Pages の準備
         id: pages
+        if: steps.cfg.outputs.configured == 'true'
         uses: actions/configure-pages@v5
 
       - name: 名簿を作る
         id: build
+        if: steps.cfg.outputs.configured == 'true'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
         run: python3 scripts/build_roster.py --out site/roster.json --previous-url "${{ steps.pages.outputs.base_url }}/roster.json"
 
       - name: 写真を名簿と一緒にまとめる
-        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
         run: cp -r docs/. site/
 
       - name: Pages に上げる中身をまとめる
-        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
         uses: actions/upload-pages-artifact@v4
         with:
           path: site
 
       - name: Pages に出す
         id: deploy
-        if: steps.build.outputs.changed == 'true' || github.event_name != 'schedule'
+        if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
         uses: actions/deploy-pages@v4
 
       - name: 定期実行を止めないための記録
