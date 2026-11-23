@@ -29,6 +29,7 @@ CONFIG = {
         {"plan": 3, "roles": ["Patreon Gold", "FANBOX 梅"]},
     ],
     "optout_role": "パネルに載せない",
+    "publish_photos": True,       # 写真まわりの試験のためにオン（実物の設定ではオフ）
     "photo_slots": 10,
     "photo_max_px": 256,
 }
@@ -48,9 +49,11 @@ def member(uid, nick, roles, bot=False):
     return {"user": {"id": uid, "bot": bot}, "nick": nick, "roles": roles}
 
 
-def make_data(d: Path, overrides: dict, photos=("p.png",)) -> Path:
+def make_data(d: Path, overrides: dict, photos=("p.png",), manual=None) -> Path:
     data = d / "data"
     (data / "photos").mkdir(parents=True)
+    if manual is not None:
+        (data / "manual.json").write_text(json.dumps({"members": manual}, ensure_ascii=False), encoding="utf-8")
     (data / "secret.json").write_text(json.dumps({"link_secret": SECRET, "slot_names": SLOTS}), encoding="utf-8")
     (data / "overrides.json").write_text(json.dumps({"members": overrides}), encoding="utf-8")
     for name in photos:
@@ -312,11 +315,51 @@ class BuildTest(unittest.TestCase):
             self.assertNotIn("Traceback", err.getvalue())
             self.assertNotIn(str(d), err.getvalue())
 
-    def test_real_config_is_placeholder(self):
-        # 実物の config.json はロール名がまだ仮なので、はっきりエラーになること
-        config = json.loads((br.ROOT / "config.json").read_text(encoding="utf-8"))
-        with self.assertRaises(br.RosterError):
-            self.build([], config=config)
+    # ---- 手で足す人・Discord なし・写真の公開オフ（2026-11-23）
+
+    def test_manual_members(self):
+        data = {"overrides": {}, "secret": None, "slot_names": [], "photos_dir": None, "manual": [
+            {"name": " GinGira ", "plan": 3},
+            {"name": "かくれさん", "plan": 2, "hidden": True},
+            {"name": "Alice", "plan": 3},                 # Discord の Alice（プラン 1）と同じ名前 → 高い方
+            {"name": "", "plan": 3}, {"name": "X", "plan": 9}, {"name": "Y", "plan": True}, "bad",
+        ]}
+        out, albums, stats = self.build([member("1", "Alice", ["r1"])], data)
+        self.assertEqual(out, [
+            {"name": "Alice", "plan": 3},
+            {"name": "GinGira", "plan": 3},
+            {"hash": br.name_hash("かくれさん"), "plan": 2},
+        ])
+        self.assertEqual(albums, [])
+        self.assertEqual(stats["manual"], 3)
+        self.assertTrue(any("manual.json" in w for w in stats["warnings"]))
+
+    def test_real_config_builds_manual_only_roster_without_discord(self):
+        # 実物の config.json（use_discord オフ・写真の公開オフ）で、トークンなしでも名簿ができること
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            data = make_data(d, {"1": {"photo": "p.png", "slot": 1}}, manual=[{"name": "GinGira", "plan": 3}])
+            old = {k: os.environ.pop(k, None) for k in ("DISCORD_BOT_TOKEN", "DISCORD_GUILD_ID")}
+            try:
+                rc = br.main(["--data", str(data), "--site", str(d / "site")])
+            finally:
+                for k, v in old.items():
+                    if v is not None:
+                        os.environ[k] = v
+            self.assertEqual(rc, 0)
+            roster = json.loads((d / "site" / "roster.json").read_text(encoding="utf-8"))
+            self.assertEqual(roster["members"], [{"name": "GinGira", "plan": 3}])
+            self.assertEqual(roster["rev"], "")
+            self.assertEqual(sorted(x.name for x in (d / "site").iterdir()), ["roster.json"])   # 写真は出ない
+
+    def test_photos_are_ignored_when_publishing_is_off(self):
+        with tempfile.TemporaryDirectory() as d:
+            data = br.load_data(make_data(Path(d), {"1": {"photo": "p.png", "slot": 2, "portal": WORLD}}), CONFIG)
+            out, albums, stats = self.build([member("1", "Alice", ["r3"])], data,
+                                            config=dict(CONFIG, publish_photos=False))
+        self.assertEqual(out, [{"name": "Alice", "plan": 3, "portal": WORLD}])
+        self.assertEqual(albums, [])
+        self.assertTrue(any("publish_photos" in w for w in stats["warnings"]))
 
 
 if __name__ == "__main__":

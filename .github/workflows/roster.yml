@@ -1,7 +1,10 @@
-# 1 時間ごとに Discord のロールから名簿を作り直し、変わっていたら GitHub Pages に出す。
-# 名簿と写真は Git の記録には入れない（公開リポジトリの履歴に名前や写真を残さないため）。Pages にだけ出す。
-# 契約者ごとの手直し・写真・秘密の値は非公開リポジトリ vrc-roster-data から読む（読むだけの鍵 = Deploy key）。
+# 1 時間ごとに名簿を作り直し、変わっていたら GitHub Pages に出す。
+# 名簿は Git の記録には入れない（公開リポジトリの履歴に名前を残さないため）。Pages にだけ出す。
+# 手で足す人・契約者ごとの手直しは非公開リポジトリ vrc-roster-data から読む（読むだけの鍵 = Deploy key）。
 # vrc-roster-data を直したときは、次の定期実行（毎時 17 分）か、Actions の「Run workflow」で反映される。
+#
+# 注意: この実行が Pages に出す中身（束）は、GitHub にログインした人なら誰でも落とせる。
+#       名簿（もともと公開）以外の物を出す中身に入れないこと。
 name: roster
 
 on:
@@ -15,10 +18,8 @@ on:
       - scripts/**
       - .github/workflows/roster.yml
 
-permissions:
-  contents: write   # 定期実行を止めないための記録（heartbeat.txt）にだけ使う
-  pages: write
-  id-token: write
+# 既定では何の権限も渡さない。要る権限は、下の仕事ごとに書く
+permissions: {}
 
 concurrency:
   group: roster
@@ -27,19 +28,33 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 秘密の値（Bot のトークン・非公開データ）を扱う仕事。リポジトリには書き込めない
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
 
       - name: 設定が済んでいるか確かめる
-        # config.json のロール名が仮（「（」で始まる）のままなら、何もせずに終わる（失敗のメールを出さない）。
+        # 準備がまだのときは、何もせずに終わる（毎時、失敗のメールが届かないように）。
+        # - config.json のロール名が仮（「（」で始まる）のまま
+        # - GitHub Pages が有効になっていない（Settings → Pages → Source を GitHub Actions に）
         id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if grep -q '"（' config.json; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "config.json のロール名がまだ仮なので、名簿は作りませんでした。" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif ! curl -sf -o /dev/null -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Pages が有効になっていないので、名簿は作りませんでした（Settings → Pages → Source を GitHub Actions にしてください）。" | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
@@ -47,7 +62,7 @@ jobs:
       - name: Pages の準備
         id: pages
         if: steps.cfg.outputs.configured == 'true'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
 
       - name: 非公開データを読む
         if: steps.cfg.outputs.configured == 'true'
@@ -58,32 +73,35 @@ jobs:
           path: data
           persist-credentials: false
 
-      - name: 写真を扱う道具を入れる
-        if: steps.cfg.outputs.configured == 'true'
-        run: python3 -m pip install --quiet --disable-pip-version-check "pillow>=11,<13"
-
-      - name: 名簿と写真を作る
+      - name: 名簿を作る
         id: build
         if: steps.cfg.outputs.configured == 'true'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
-        run: python3 scripts/build_roster.py --data data --site site --previous-url "${{ steps.pages.outputs.base_url }}/roster.json"
+          PREVIOUS_URL: ${{ steps.pages.outputs.base_url }}/roster.json
+        run: python3 scripts/build_roster.py --data data --site site --previous-url "$PREVIOUS_URL"
 
       - name: Pages に上げる中身をまとめる
         if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
       - name: Pages に出す
         id: deploy
         if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
+  keepalive:
+    runs-on: ubuntu-latest
+    # 公開リポジトリの定期実行は、60 日動きが無いと GitHub に止められる。
+    # 25 日以上記録が無ければ、目印のファイルだけ書き換えて動きを作る。秘密の値は一切渡さない
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
       - name: 定期実行を止めないための記録
-        # 公開リポジトリの定期実行は、60 日動きが無いと GitHub に止められる。
-        # 25 日以上記録が無ければ、目印のファイルだけ書き換えて動きを作る。
         run: |
           last=$(git log -1 --format=%ct)
           now=$(date +%s)

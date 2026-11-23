@@ -1,11 +1,13 @@
 {
- "_説明": "plans の roles に、Patreon と FANBOX の連携で付くロールの名前をそのまま書く（大文字小文字・空白も同じに）。1 人が複数のロールを持つときは高い方のプランになる。optout_role は本人が付け外しする「パネルに載せない」ロールの名前。photo_slots は写真立ての自動表示の枠の数（ワールドに入れる URL の数と合わせる）。photo_max_px は写真の長い辺の最大の画素数（Quest の負担を考えて 1024）。契約者ごとの手直し・写真・秘密の値は非公開リポジトリ vrc-roster-data に置く。",
+ "_説明": "use_discord がオフの間は Discord を読まず、非公開リポジトリの manual.json に書いた人だけで名簿を作る。Bot とロールの準備ができたら、plans の roles に Patreon と FANBOX の連携で付くロールの名前をそのまま書き（大文字小文字・空白も同じに）、use_discord をオンにする。1 人が複数のロールを持つときは高い方のプランになる。optout_role は本人が付け外しする「パネルに載せない」ロールの名前。publish_photos は写真を Pages に出すかどうか（オフのままにする。公開リポジトリの実行は、出す中身の束を誰でも落とせる形で残すため。写真立てはワールドに画像の URL を貼る方式）。photo_slots と photo_max_px は publish_photos がオンのときだけ使う。",
+ "use_discord": false,
  "plans": [
-  {"plan": 1, "roles": ["（Patreon のプラン 1 のロール名）", "（FANBOX のプラン 1 のロール名）"]},
-  {"plan": 2, "roles": ["（Patreon のプラン 2 のロール名）", "（FANBOX のプラン 2 のロール名）"]},
-  {"plan": 3, "roles": ["（Patreon のプラン 3 のロール名）", "（FANBOX のプラン 3 のロール名）"]}
+  {"plan": 1, "roles": []},
+  {"plan": 2, "roles": []},
+  {"plan": 3, "roles": []}
  ],
  "optout_role": "パネルに載せない",
+ "publish_photos": false,
  "photo_slots": 10,
  "photo_max_px": 1024
 }

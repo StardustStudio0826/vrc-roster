@@ -8,6 +8,13 @@
   - secret.json     リンクの名前を作る秘密の値と、ワールドに入れる枠のファイル名
   - photos/         写真の元のファイル
 
+  - manual.json     手で足す人（Discord のロールに関係なく載せる人）
+
+config.json の use_discord がオフの間は Discord を読まず、manual.json の人だけで名簿を作る。
+写真（a/・s/）は config.json の publish_photos がオンのときだけ出す。既定はオフ:
+公開リポジトリの実行は Pages に出す中身の束を誰でも落とせる形で残すので、写真は出さない
+（写真立ては、ワールドに画像の URL を貼る方式に変えた）。
+
 出力（Git には入れず、GitHub Pages にだけ出す。公開リポジトリの履歴に名前や写真を残さないため）
 - roster.json        名簿。パネルに載せない人は名前の代わりにハッシュ。枠の番号は載るが写真の場所は載らない
 - a/<推測されにくい名前>.jpg  本人に渡すアルバムのリンク（ワールドの URL 欄に貼る方式）
@@ -138,7 +145,7 @@ def fetch_guild(token: str, guild_id: str) -> dict:
 def load_data(data_dir: Path | None, config: dict) -> dict:
     """非公開リポジトリの中身を読む。--data が無いとき（試し）は空として扱う。"""
     if data_dir is None:
-        return {"overrides": {}, "secret": None, "slot_names": [], "photos_dir": None}
+        return {"overrides": {}, "secret": None, "slot_names": [], "photos_dir": None, "manual": []}
     try:
         overrides = json.loads((data_dir / "overrides.json").read_text(encoding="utf-8"))
         secret = json.loads((data_dir / "secret.json").read_text(encoding="utf-8"))
@@ -158,11 +165,21 @@ def load_data(data_dir: Path | None, config: dict) -> dict:
         not re.fullmatch(r"[0-9a-z]{16,64}", s) for s in slot_names
     ):
         raise RosterError("secret.json の slot_names は、重ならない英小文字と数字（16 文字以上）にしてください。")
+    # 手で足す人（Discord のロールに関係なく名簿に載せる人）。無ければ空
+    manual: list = []
+    manual_path = data_dir / "manual.json"
+    if manual_path.is_file():
+        loaded = json.loads(manual_path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict) and isinstance(loaded.get("members"), list):
+            manual = loaded["members"]
+        else:
+            raise RosterError("manual.json の書き方が崩れています（{\"members\": [ ... ]} の形にしてください）。")
     return {
         "overrides": overrides.get("members", {}),
         "secret": link_secret,
         "slot_names": slot_names,
         "photos_dir": data_dir / "photos",
+        "manual": manual,
     }
 
 
@@ -250,12 +267,20 @@ def check_override(uid: str, ov: dict, config: dict, data: dict, warnings: list[
 
 def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, dict]:
     """名簿の行・写真の処理リスト・件数を返す。写真の処理リストは公開しない。"""
-    plan_of_role, optout_id = resolve_plans(config, guild["roles"])
+    # use_discord がオフの間は Discord を読まない（Bot とロールの準備ができるまで、手で足した人だけで名簿を作る）
+    if config.get("use_discord", True):
+        plan_of_role, optout_id = resolve_plans(config, guild["roles"])
+    else:
+        plan_of_role, optout_id = {}, None
     ov_all: dict = data.get("overrides", {})
+    # 写真の公開はオフが既定。公開リポジトリの実行は、Pages に出す中身の束を誰でも落とせる形で残すため
+    # （写真立ては、ワールドに画像の URL を貼る方式に変えた）。オフの間、写真と枠の設定は使わない。
+    publish_photos = bool(config.get("publish_photos", False))
+    ignored_photo_settings = False
 
     stats = {"subscribers": 0, "panel": 0, "hidden": 0, "no_nick": 0,
              "duplicates": 0, "unused_overrides": 0, "albums": 0, "slots_used": 0,
-             "bad_name": 0, "bad_photos": 0}
+             "bad_name": 0, "bad_photos": 0, "manual": 0}
     warnings: list[str] = []
 
     groups: dict[str, list[dict]] = {}
@@ -279,9 +304,27 @@ def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, di
         seen_uids.add(uid)
         hidden = optout_id is not None and optout_id in m.get("roles", [])
         extra = check_override(uid, ov_all[uid], config, data, warnings) if uid in ov_all else {}
+        if not publish_photos and ("photo" in extra or "slot" in extra):
+            ignored_photo_settings = True
+            extra = {k: v for k, v in extra.items() if k == "portal"}
 
         groups.setdefault(normalize_name(name), []).append(
             {"name": name, "plan": plan, "hidden": hidden, "uid": uid, "extra": extra})
+
+    if ignored_photo_settings:
+        warnings.append("写真と枠の設定は使っていません（config.json の publish_photos がオフ）")
+
+    # 手で足す人（manual.json）。Discord の人と同じ名前なら、下の「同じ名前」の決まりでまとめる
+    for m in data.get("manual", []):
+        name = str(m.get("name", "")).strip() if isinstance(m, dict) else ""
+        plan = m.get("plan") if isinstance(m, dict) else None
+        if (not name or any(unicodedata.category(c) in ("Cc", "Cf") for c in name)
+                or not isinstance(plan, int) or isinstance(plan, bool) or not 1 <= plan <= 3):
+            warnings.append("manual.json に、名前かプラン（1〜3）の書き方が合っていない行があります")
+            continue
+        stats["manual"] += 1
+        groups.setdefault(normalize_name(name), []).append(
+            {"name": name, "plan": plan, "hidden": m.get("hidden") is True, "uid": "", "extra": {}})
 
     stats["unused_overrides"] = sum(1 for uid in ov_all if uid not in seen_uids)
 
@@ -448,6 +491,7 @@ def report(stats: dict, changed: bool) -> str:
     lines = [
         f"契約者 {stats['subscribers']} 人（パネルに載る {stats['panel']}・載せない {stats['hidden']}）",
         f"写真のある人 {stats['albums']}・使っている枠 {stats['slots_used']}",
+        f"手で足した人: {stats['manual']}",
         f"ニックネーム未設定で載せなかった人: {stats['no_nick']}",
         f"見えない文字が入った名前で載せなかった人: {stats['bad_name']}",
         f"読めなくて飛ばした写真: {stats['bad_photos']}",
@@ -502,6 +546,8 @@ def main(argv: list[str] | None = None) -> int:
         data = load_data(data_dir, config)
         if args.from_file:
             guild = json.loads(Path(args.from_file).read_text(encoding="utf-8"))
+        elif not config.get("use_discord", True):
+            guild = {"roles": [], "members": []}
         else:
             token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
             guild_id = os.environ.get("DISCORD_GUILD_ID", "").strip()
