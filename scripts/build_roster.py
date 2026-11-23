@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""VRChat ワールド用の契約者名簿（roster.json）を Discord のロールから作る。
+"""VRChat ワールド用の契約者名簿（roster.json）と写真立ての画像を作る。
 
-名簿は Git には入れず、GitHub Pages にだけ出す（公開リポジトリの履歴に名前を残さないため）。
+入力
+- Discord: 契約者 = config.json の plans に書いたロールを持つメンバー。VRChat 名 = サーバー内のニックネーム
+- 非公開リポジトリ vrc-roster-data（--data）:
+  - overrides.json  契約者ごとの手直し（Discord のユーザー ID ごと）: 写真・枠の番号・ポータルの行き先
+  - secret.json     リンクの名前を作る秘密の値と、ワールドに入れる枠のファイル名
+  - photos/         写真の元のファイル
 
-- 契約者 = config.json の plans に書いたロールのどれかを持つメンバー
-- VRChat 名 = そのサーバーでのニックネーム（未設定の人は載せない）
-- 「パネルに載せない」ロールを持つ人は、名前の代わりにハッシュで載せる
-- プラン 3 の写真の枠・ポータルの行き先は overrides.json（Discord のユーザー ID ごと）から足す
+出力（Git には入れず、GitHub Pages にだけ出す。公開リポジトリの履歴に名前や写真を残さないため）
+- roster.json        名簿。パネルに載せない人は名前の代わりにハッシュ。枠の番号は載るが写真の場所は載らない
+- a/<推測されにくい名前>.jpg  本人に渡すアルバムのリンク（ワールドの URL 欄に貼る方式）
+- s/<推測されにくい名前>.jpg  ワールドに入れておく枠（自動表示の方式）。割り当てた人の写真を写す
 
-公開リポジトリで動くので、ログには人の名前を出さない（件数だけ）。
-外部のライブラリは使わない（Python 標準だけ）。
+公開リポジトリで動くので、ログには人の名前・ID・リンクを出さない（件数だけ）。
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -29,16 +34,18 @@ ROOT = Path(__file__).resolve().parent.parent
 API = "https://discord.com/api/v10"
 USER_AGENT = "DiscordBot (https://github.com, 1.0)"
 ROSTER_VERSION = 1
+DEFAULT_BASE_URL = "https://starduststudio0826.github.io/vrc-roster"
 WORLD_ID_RE = re.compile(
     r"^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
+PHOTO_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 
 class RosterError(Exception):
     """名簿を作れないときのエラー（メッセージはそのまま利用者に見せる）。"""
 
 
-# ---------------------------------------------------------------- 名前とハッシュ
+# ---------------------------------------------------------------- 名前・ハッシュ・リンク
 
 def normalize_name(name: str) -> str:
     """照合用の形にそろえる: 前後の空白を除くだけ（大文字小文字は区別する）。
@@ -52,6 +59,15 @@ def normalize_name(name: str) -> str:
 def name_hash(name: str) -> str:
     """normalize_name した名前の UTF-8 を SHA-256 にかけた 16 進（小文字 64 文字）。"""
     return hashlib.sha256(normalize_name(name).encode("utf-8")).hexdigest()
+
+
+def album_link_name(secret: str, uid: str, version: int) -> str:
+    """本人用アルバムのファイル名（秘密の値から作るので、知らない人には推測できない）。
+
+    version を上げると、同じ人でも別のリンクになる（リンクが広まったときの作り直し用）。
+    """
+    msg = f"album:{uid}:{version}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:24]
 
 
 # ---------------------------------------------------------------- Discord から読む
@@ -112,6 +128,39 @@ def fetch_guild(token: str, guild_id: str) -> dict:
     return {"roles": roles, "members": members}
 
 
+# ---------------------------------------------------------------- 非公開データを読む
+
+def load_data(data_dir: Path | None, config: dict) -> dict:
+    """非公開リポジトリの中身を読む。--data が無いとき（試し）は空として扱う。"""
+    if data_dir is None:
+        return {"overrides": {}, "secret": None, "slot_names": [], "photos_dir": None}
+    try:
+        overrides = json.loads((data_dir / "overrides.json").read_text(encoding="utf-8"))
+        secret = json.loads((data_dir / "secret.json").read_text(encoding="utf-8"))
+    except FileNotFoundError as e:
+        raise RosterError(f"非公開データに {Path(e.filename).name} がありません。") from None
+    link_secret = secret.get("link_secret", "")
+    slot_names = secret.get("slot_names", [])
+    if len(link_secret) < 32:
+        raise RosterError("secret.json の link_secret が短すぎます（32 文字以上）。")
+    slots = int(config.get("photo_slots", 0))
+    if len(slot_names) < slots:
+        raise RosterError(
+            f"secret.json の slot_names が {len(slot_names)} 個しかありません"
+            f"（config.json の photo_slots は {slots}）。"
+        )
+    if len(set(slot_names)) != len(slot_names) or any(
+        not re.fullmatch(r"[0-9a-z]{16,64}", s) for s in slot_names
+    ):
+        raise RosterError("secret.json の slot_names は、重ならない英小文字と数字（16 文字以上）にしてください。")
+    return {
+        "overrides": overrides.get("members", {}),
+        "secret": link_secret,
+        "slot_names": slot_names,
+        "photos_dir": data_dir / "photos",
+    }
+
+
 # ---------------------------------------------------------------- 名簿を組み立てる
 
 def resolve_plans(config: dict, roles: list) -> tuple[dict, str | None]:
@@ -157,31 +206,47 @@ def resolve_plans(config: dict, roles: list) -> tuple[dict, str | None]:
     return plan_of_role, optout_id
 
 
-def check_override(uid: str, ov: dict, config: dict, warnings: list[str]) -> dict:
-    """手直しの 1 人分を確かめ、名簿に足す項目だけ返す（おかしい項目は捨てて警告）。"""
-    extra: dict = {}
+def check_override(uid: str, ov: dict, config: dict, data: dict, warnings: list[str]) -> dict:
+    """手直しの 1 人分を確かめる（おかしい項目は捨てて警告。警告に ID は出さない）。
+
+    返す dict: slot（名簿に載る）・portal（名簿に載る）・photo / version（写真の処理用・名簿には載らない）
+    """
+    out: dict = {}
     slots = int(config.get("photo_slots", 0))
-    if "photo_slot" in ov:
-        slot = ov["photo_slot"]
-        if isinstance(slot, int) and not isinstance(slot, bool) and 1 <= slot <= slots:
-            extra["photo"] = slot
+    if "photo" in ov:
+        photo = ov["photo"]
+        pdir = data.get("photos_dir")
+        if (isinstance(photo, str) and pdir is not None and "/" not in photo and "\\" not in photo
+                and Path(photo).suffix.lower() in PHOTO_EXTS and (pdir / photo).is_file()):
+            out["photo"] = photo
+            version = ov.get("link_version", 1)
+            out["version"] = version if isinstance(version, int) and version >= 1 else 1
         else:
-            warnings.append(f"ID {uid}: photo_slot は 1〜{slots} の整数にしてください")
+            warnings.append("写真のファイルが photos/ に無いか、形式が PNG・JPG・WebP ではない人がいます")
+    if "slot" in ov:
+        slot = ov["slot"]
+        if not (isinstance(slot, int) and not isinstance(slot, bool) and 1 <= slot <= slots):
+            warnings.append(f"枠の番号（slot）が 1〜{slots} の整数になっていない人がいます")
+        elif "photo" not in out:
+            warnings.append("枠（slot）はあるのに写真が無い人がいます（枠は使いません）")
+        else:
+            out["slot"] = slot
     if "portal" in ov:
         portal = ov["portal"]
         if isinstance(portal, str) and WORLD_ID_RE.match(portal):
-            extra["portal"] = portal
+            out["portal"] = portal
         else:
-            warnings.append(f"ID {uid}: portal は wrld_ で始まるワールド ID にしてください")
-    return extra
+            warnings.append("ポータルの行き先（portal）が wrld_ で始まるワールド ID になっていない人がいます")
+    return out
 
 
-def build_members(guild: dict, config: dict, overrides: dict) -> tuple[list, dict]:
+def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, dict]:
+    """名簿の行・写真の処理リスト・件数を返す。写真の処理リストは公開しない。"""
     plan_of_role, optout_id = resolve_plans(config, guild["roles"])
-    ov_all: dict = overrides.get("members", {})
+    ov_all: dict = data.get("overrides", {})
 
     stats = {"subscribers": 0, "panel": 0, "hidden": 0, "no_nick": 0,
-             "duplicates": 0, "unused_overrides": 0}
+             "duplicates": 0, "unused_overrides": 0, "albums": 0, "slots_used": 0}
     warnings: list[str] = []
 
     by_key: dict[str, dict] = {}
@@ -200,7 +265,7 @@ def build_members(guild: dict, config: dict, overrides: dict) -> tuple[list, dic
             continue
         seen_uids.add(uid)
         hidden = optout_id is not None and optout_id in m.get("roles", [])
-        extra = check_override(uid, ov_all[uid], config, warnings) if uid in ov_all else {}
+        extra = check_override(uid, ov_all[uid], config, data, warnings) if uid in ov_all else {}
 
         key = normalize_name(name)
         if key in by_key:
@@ -209,56 +274,89 @@ def build_members(guild: dict, config: dict, overrides: dict) -> tuple[list, dic
             prev = by_key[key]
             prev["plan"] = max(prev["plan"], plan)
             prev["hidden"] = prev["hidden"] or hidden
-            for k, v in extra.items():
-                prev["extra"].setdefault(k, v)
             continue
-        by_key[key] = {"name": name, "plan": plan, "hidden": hidden, "extra": extra}
+        by_key[key] = {"name": name, "plan": plan, "hidden": hidden, "uid": uid, "extra": extra}
 
     stats["unused_overrides"] = sum(1 for uid in ov_all if uid not in seen_uids)
 
-    # 写真の枠の重なりを確かめる（先に来た人を残す）
-    used_slots: dict[int, str] = {}
+    # 枠の重なりを確かめる（名前順で先の人を残す）
+    used_slots: set[int] = set()
     for key in sorted(by_key):
-        slot = by_key[key]["extra"].get("photo")
+        slot = by_key[key]["extra"].get("slot")
         if slot is None:
             continue
         if slot in used_slots:
-            warnings.append(f"写真の枠 {slot} が 2 人以上に割り当てられています（1 人分だけ残しました）")
-            del by_key[key]["extra"]["photo"]
+            warnings.append(f"枠 {slot} が 2 人以上に割り当てられています（1 人分だけ残しました）")
+            del by_key[key]["extra"]["slot"]
         else:
-            used_slots[slot] = key
+            used_slots.add(slot)
 
-    shown, hidden_list = [], []
+    shown, hidden_list, albums = [], [], []
     for e in by_key.values():
         stats["subscribers"] += 1
+        ex = e["extra"]
+        public = {k: ex[k] for k in ("slot", "portal") if k in ex}
+        if "photo" in ex:
+            albums.append({"uid": e["uid"], "photo": ex["photo"], "version": ex["version"],
+                           "slot": ex.get("slot")})
         if e["hidden"]:
             stats["hidden"] += 1
-            hidden_list.append({"hash": name_hash(e["name"]), "plan": e["plan"], **e["extra"]})
+            hidden_list.append({"hash": name_hash(e["name"]), "plan": e["plan"], **public})
         else:
             stats["panel"] += 1
-            shown.append({"name": e["name"], "plan": e["plan"], **e["extra"]})
+            shown.append({"name": e["name"], "plan": e["plan"], **public})
 
-    shown.sort(key=lambda x: (-x["plan"], normalize_name(x["name"]), x["name"]))
+    shown.sort(key=lambda x: (-x["plan"], x["name"]))
     hidden_list.sort(key=lambda x: x["hash"])
-    stats["warnings"] = warnings
-    return shown + hidden_list, stats
+    stats["albums"] = len(albums)
+    stats["slots_used"] = len(used_slots)
+    stats["warnings"] = sorted(set(warnings))
+    return shown + hidden_list, albums, stats
 
 
-def missing_photo_files(members: list, photos_dir: Path) -> list[int]:
-    return sorted(
-        m["photo"] for m in members
-        if "photo" in m and not (photos_dir / f"{m['photo']:02d}.png").is_file()
-    )
+# ---------------------------------------------------------------- 写真を整えて出す
+
+def make_photo(src: Path, dst: Path, max_px: int) -> None:
+    """向きを直し、写真の付加情報（撮影場所など）を消し、長い辺を max_px 以下にして JPG で保存。"""
+    from PIL import Image, ImageOps  # 写真を扱うときだけ使う
+
+    with Image.open(src) as im:
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        im.thumbnail((max_px, max_px), Image.LANCZOS)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        im.save(dst, "JPEG", quality=88, optimize=True)  # exif を渡さない = 付加情報は残らない
+
+
+def publish_photos(albums: list, data: dict, config: dict, site: Path) -> str:
+    """アルバムと枠の画像を site/ に書き、中身の目印（rev）を返す。"""
+    max_px = int(config.get("photo_max_px", 1024))
+    digest = hashlib.sha256()
+    for a in sorted(albums, key=lambda x: album_link_name(data["secret"], x["uid"], x["version"])):
+        link = album_link_name(data["secret"], a["uid"], a["version"])
+        album_path = site / "a" / f"{link}.jpg"
+        make_photo(data["photos_dir"] / a["photo"], album_path, max_px)
+        body = album_path.read_bytes()
+        digest.update(b"a/" + link.encode() + b"\0" + body)
+        if a["slot"] is not None:
+            slot_name = data["slot_names"][a["slot"] - 1]
+            slot_path = site / "s" / f"{slot_name}.jpg"
+            slot_path.parent.mkdir(parents=True, exist_ok=True)
+            slot_path.write_bytes(body)
+            digest.update(b"s/" + slot_name.encode() + b"\0" + body)
+    return digest.hexdigest()[:16]
 
 
 # ---------------------------------------------------------------- 書き出し
 
 def fetch_previous(url: str) -> dict | None:
-    """いま公開中の名簿を読む（初回や読めないときは None = 変わったとみなす）。
-
-    名簿は Git の記録に残さない（公開リポジトリの履歴から、後で「載せない」にした人の
-    名前が読めてしまうため）。変わったかどうかは公開中の物と比べて決める。
-    """
+    """いま公開中の名簿を読む（初回や読めないときは None = 変わったとみなす）。"""
     sep = "&" if "?" in url else "?"
     req = urllib.request.Request(f"{url}{sep}t={int(time.time())}",
                                  headers={"User-Agent": USER_AGENT})
@@ -270,13 +368,18 @@ def fetch_previous(url: str) -> dict | None:
         return None
 
 
-def decide_roster(previous: dict | None, members: list) -> tuple[dict, bool]:
-    """前の名簿と比べ、書き出す中身と「変わったか」を返す。変わらなければ updated も前のまま。"""
+def decide_roster(previous: dict | None, members: list, rev: str = "") -> tuple[dict, bool]:
+    """前の名簿と比べ、書き出す中身と「変わったか」を返す。変わらなければ updated も前のまま。
+
+    rev は写真の中身の目印。名簿が同じでも写真が変われば「変わった」になる。
+    """
     if (previous and previous.get("version") == ROSTER_VERSION
-            and previous.get("members") == members and previous.get("updated")):
-        return {"version": ROSTER_VERSION, "updated": previous["updated"], "members": members}, False
+            and previous.get("members") == members and previous.get("rev", "") == rev
+            and previous.get("updated")):
+        return {"version": ROSTER_VERSION, "updated": previous["updated"], "rev": rev,
+                "members": members}, False
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return {"version": ROSTER_VERSION, "updated": now, "members": members}, True
+    return {"version": ROSTER_VERSION, "updated": now, "rev": rev, "members": members}, True
 
 
 def write_json(path: Path, data: dict) -> None:
@@ -286,36 +389,60 @@ def write_json(path: Path, data: dict) -> None:
         f.write("\n")
 
 
-def report(stats: dict, changed: bool, missing_photos: list[int]) -> str:
+def report(stats: dict, changed: bool) -> str:
     lines = [
         f"契約者 {stats['subscribers']} 人（パネルに載る {stats['panel']}・載せない {stats['hidden']}）",
+        f"写真のある人 {stats['albums']}・使っている枠 {stats['slots_used']}",
         f"ニックネーム未設定で載せなかった人: {stats['no_nick']}",
         f"名前が重なった人: {stats['duplicates']}",
         f"契約していない人への手直し（無視）: {stats['unused_overrides']}",
         "名簿: " + ("更新しました" if changed else "変わりなし"),
     ]
-    if missing_photos:
-        lines.append("写真のファイルが無い枠: " + ", ".join(f"{s:02d}.png" for s in missing_photos))
     for w in stats["warnings"]:
         lines.append("注意: " + w)
     return "\n".join(lines)
 
 
+def print_links(data_dir: Path, config: dict, base_url: str) -> None:
+    """手元用: 本人に渡すアルバムのリンクと、ワールドに入れる枠の URL を出す（公開の場では使わない）。"""
+    data = load_data(data_dir, config)
+    base = base_url.rstrip("/")
+    print("■ ワールドに入れる枠の URL（写真立ての自動表示用）")
+    for i, name in enumerate(data["slot_names"][: int(config.get("photo_slots", 0))], start=1):
+        print(f"  枠 {i:2d}: {base}/s/{name}.jpg")
+    print("■ 本人に渡すアルバムのリンク（Discord のユーザー ID ごと）")
+    for uid, ov in sorted(data["overrides"].items()):
+        if "photo" not in ov:
+            continue
+        version = ov.get("link_version", 1)
+        version = version if isinstance(version, int) and version >= 1 else 1
+        memo = f"  （{ov['memo']}）" if isinstance(ov.get("memo"), str) else ""
+        print(f"  {uid}: {base}/a/{album_link_name(data['secret'], uid, version)}.jpg{memo}")
+
+
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Discord のロールから VRChat 用の名簿を作る")
+    p = argparse.ArgumentParser(description="Discord のロールから VRChat 用の名簿と写真立ての画像を作る")
     p.add_argument("--config", default=str(ROOT / "config.json"))
-    p.add_argument("--overrides", default=str(ROOT / "overrides.json"))
-    p.add_argument("--out", default=str(ROOT / "site" / "roster.json"),
+    p.add_argument("--data", help="非公開リポジトリ vrc-roster-data の場所")
+    p.add_argument("--site", default=str(ROOT / "site"),
                    help="書き出し先（Git には入れない。Pages にだけ出す）")
-    p.add_argument("--photos", default=str(ROOT / "docs" / "photos"))
     p.add_argument("--previous-url", help="いま公開中の名簿の URL（変わったかの判定に使う）")
     p.add_argument("--previous-file", help="試し用: 前の名簿をファイルから読む")
     p.add_argument("--from-file", help="Discord の代わりに読む試し用のファイル（roles と members）")
+    p.add_argument("--print-links", action="store_true",
+                   help="手元用: 枠の URL と本人用のリンクを表示して終わる")
+    p.add_argument("--base-url", default=DEFAULT_BASE_URL)
     args = p.parse_args(argv)
 
     try:
         config = json.loads(Path(args.config).read_text(encoding="utf-8"))
-        overrides = json.loads(Path(args.overrides).read_text(encoding="utf-8"))
+        data_dir = Path(args.data) if args.data else None
+        if args.print_links:
+            if data_dir is None:
+                raise RosterError("--print-links には --data（非公開リポジトリの場所）が要ります。")
+            print_links(data_dir, config, args.base_url)
+            return 0
+        data = load_data(data_dir, config)
         if args.from_file:
             guild = json.loads(Path(args.from_file).read_text(encoding="utf-8"))
         else:
@@ -328,7 +455,9 @@ def main(argv: list[str] | None = None) -> int:
                 )
             guild = fetch_guild(token, guild_id)
 
-        members, stats = build_members(guild, config, overrides)
+        members, albums, stats = build_members(guild, config, data)
+        site = Path(args.site)
+        rev = publish_photos(albums, data, config, site) if albums else ""
         if args.previous_file:
             p_path = Path(args.previous_file)
             previous = json.loads(p_path.read_text(encoding="utf-8")) if p_path.is_file() else None
@@ -336,10 +465,10 @@ def main(argv: list[str] | None = None) -> int:
             previous = fetch_previous(args.previous_url)
         else:
             previous = None
-        data, changed = decide_roster(previous, members)
-        write_json(Path(args.out), data)
+        roster, changed = decide_roster(previous, members, rev)
+        write_json(site / "roster.json", roster)
         _output("changed", "true" if changed else "false")
-        text = report(stats, changed, missing_photo_files(members, Path(args.photos)))
+        text = report(stats, changed)
     except RosterError as e:
         text = "名簿を作れませんでした: " + str(e)
         print(text, file=sys.stderr)

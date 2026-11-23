@@ -1,6 +1,7 @@
 # 1 時間ごとに Discord のロールから名簿を作り直し、変わっていたら GitHub Pages に出す。
-# 名簿は Git の記録には入れない（公開リポジトリの履歴に名前を残さないため）。Pages にだけ出す。
-# 設定や手直し（config.json・overrides.json・写真）を push したときと、手動実行でも動く。
+# 名簿と写真は Git の記録には入れない（公開リポジトリの履歴に名前や写真を残さないため）。Pages にだけ出す。
+# 契約者ごとの手直し・写真・秘密の値は非公開リポジトリ vrc-roster-data から読む（読むだけの鍵 = Deploy key）。
+# vrc-roster-data を直したときは、次の定期実行（毎時 17 分）か、Actions の「Run workflow」で反映される。
 name: roster
 
 on:
@@ -11,8 +12,6 @@ on:
     branches: [main]
     paths:
       - config.json
-      - overrides.json
-      - docs/**
       - scripts/**
       - .github/workflows/roster.yml
 
@@ -50,17 +49,26 @@ jobs:
         if: steps.cfg.outputs.configured == 'true'
         uses: actions/configure-pages@v5
 
-      - name: 名簿を作る
+      - name: 非公開データを読む
+        if: steps.cfg.outputs.configured == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: StardustStudio0826/vrc-roster-data
+          ssh-key: ${{ secrets.DATA_DEPLOY_KEY }}
+          path: data
+          persist-credentials: false
+
+      - name: 写真を扱う道具を入れる
+        if: steps.cfg.outputs.configured == 'true'
+        run: python3 -m pip install --quiet --disable-pip-version-check "pillow>=11,<13"
+
+      - name: 名簿と写真を作る
         id: build
         if: steps.cfg.outputs.configured == 'true'
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_GUILD_ID: ${{ secrets.DISCORD_GUILD_ID }}
-        run: python3 scripts/build_roster.py --out site/roster.json --previous-url "${{ steps.pages.outputs.base_url }}/roster.json"
-
-      - name: 写真を名簿と一緒にまとめる
-        if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
-        run: cp -r docs/. site/
+        run: python3 scripts/build_roster.py --data data --site site --previous-url "${{ steps.pages.outputs.base_url }}/roster.json"
 
       - name: Pages に上げる中身をまとめる
         if: steps.cfg.outputs.configured == 'true' && (steps.build.outputs.changed == 'true' || github.event_name != 'schedule')
