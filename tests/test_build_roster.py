@@ -207,6 +207,111 @@ class BuildTest(unittest.TestCase):
                 self.assertEqual(len(im.getexif()), 0)                 # 付加情報は消える
             self.assertNotIn(b"SecretCameraMaker", alice.read_bytes())
 
+    # ---- 安全面の試験（2026-11-23 の点検で足した）
+
+    def test_copied_nickname_cannot_take_over(self):
+        # 古いアカウント（ID が小さい＝先に並ぶ）の人が、他人の名前をニックネームにしても、
+        # 本人の枠・ポータル・写真は消えない
+        with tempfile.TemporaryDirectory() as d:
+            data = br.load_data(make_data(Path(d), {"2": {"photo": "p.png", "slot": 2, "portal": WORLD}}), CONFIG)
+            out, albums, stats = self.build([
+                member("1", "Victim", ["r1", "op"]),     # なりすまし（プラン 1・載せない）
+                member("2", "Victim", ["r3"]),           # 本人（プラン 3・枠 2）
+            ], data)
+        self.assertEqual(out, [{"hash": br.name_hash("Victim"), "plan": 3, "slot": 2, "portal": WORLD}])
+        self.assertEqual(albums, [{"uid": "2", "photo": "p.png", "version": 1, "slot": 2}])
+        self.assertEqual(stats["duplicates"], 1)
+        self.assertTrue(any("同じ名前" in w for w in stats["warnings"]))
+
+    def test_duplicate_names_with_two_slot_owners(self):
+        # 同じ名前の 2 人がどちらも枠を持っていたら、どちらの枠も使わない（写真のリンクは両方残る）
+        with tempfile.TemporaryDirectory() as d:
+            data = br.load_data(make_data(Path(d), {
+                "1": {"photo": "p.png", "slot": 1}, "2": {"photo": "p.png", "slot": 2}}), CONFIG)
+            out, albums, _ = self.build([member("1", "Same", ["r3"]), member("2", "Same", ["r3"])], data)
+        self.assertEqual(out, [{"name": "Same", "plan": 3}])
+        self.assertEqual(sorted((a["uid"], a["slot"]) for a in albums), [("1", None), ("2", None)])
+
+    def test_names_with_invisible_characters_are_skipped(self):
+        out, _, stats = self.build([
+            member("1", "Ali​ce", ["r1"]),      # 見えない文字入り（見た目が同じ別の名前）
+            member("2", "Bob\nBob", ["r1"]),         # 改行入り
+            member("3", "山田 たろう", ["r1"]),        # 普通の名前はそのまま
+        ])
+        self.assertEqual(out, [{"name": "山田 たろう", "plan": 1}])
+        self.assertEqual(stats["bad_name"], 2)
+
+    @unittest.skipIf(Image is None, "Pillow が無い")
+    def test_bad_photos_are_skipped_without_leaking_names(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            data_dir = make_data(d, {
+                "1": {"photo": "alice_secret_name.png", "slot": 1},   # 壊れたファイル
+                "2": {"photo": "bob_secret_name.png"},                # 中身が PNG ではない（BMP）
+                "3": {"photo": "p.png"},                              # 正常
+            })
+            (data_dir / "photos" / "alice_secret_name.png").write_bytes(b"this is not an image")
+            Image.new("RGB", (8, 8)).save(data_dir / "photos" / "bob_secret_name.png", format="BMP")
+            (d / "config.json").write_text(json.dumps(CONFIG, ensure_ascii=False), encoding="utf-8")
+            (d / "guild.json").write_text(json.dumps({"roles": ROLES, "members": [
+                member("1", "Alice", ["r3"]), member("2", "Bob", ["r3"]), member("3", "Carol", ["r3"])]}),
+                encoding="utf-8")
+            args = ["--config", str(d / "config.json"), "--data", str(data_dir), "--site", str(d / "site"),
+                    "--from-file", str(d / "guild.json")]
+            old_ci, br.IN_CI = br.IN_CI, True          # 公開の実行記録に出る場として動かす
+            out, err = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    rc = br.main(args)
+            finally:
+                br.IN_CI = old_ci
+            self.assertEqual(rc, 0)                                     # 名簿全体は止まらない
+            self.assertIn("読めなくて飛ばした写真: 2", out.getvalue())
+            self.assertNotIn("secret_name", out.getvalue() + err.getvalue())   # ファイル名は出さない
+            self.assertEqual(len(list((d / "site" / "a").iterdir())), 1)       # 正常な 1 枚だけ出る
+            self.assertFalse((d / "site" / "s").exists())                      # 壊れた写真の枠は出さない
+            roster = json.loads((d / "site" / "roster.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(roster["members"]), 3)
+
+    @unittest.skipIf(Image is None, "Pillow が無い")
+    def test_huge_photo_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "big.png"
+            Image.new("L", (100, 100)).save(src)
+            old = br.PHOTO_MAX_PIXELS
+            br.PHOTO_MAX_PIXELS = 5000                 # 試験用に上限を小さくする
+            try:
+                with self.assertRaises(Exception):
+                    br.make_photo(src, Path(d) / "out.jpg", 64)
+            finally:
+                br.PHOTO_MAX_PIXELS = old
+                from PIL import Image as _I
+                _I.MAX_IMAGE_PIXELS = 89_478_485       # Pillow の既定に戻す
+            self.assertFalse((Path(d) / "out.jpg").exists())
+
+    def test_unexpected_error_prints_only_its_type_in_ci(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "config.json").write_text(json.dumps({"no_plans_here": "secret_detail"}), encoding="utf-8")
+            (d / "guild.json").write_text(json.dumps({"roles": ROLES, "members": []}), encoding="utf-8")
+            args = ["--config", str(d / "config.json"), "--site", str(d / "site"),
+                    "--from-file", str(d / "guild.json")]
+            old_ci, br.IN_CI = br.IN_CI, True
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    rc = br.main(args)
+            finally:
+                br.IN_CI = old_ci
+            self.assertEqual(rc, 1)
+            self.assertIn("KeyError", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertNotIn(str(d), err.getvalue())
+
     def test_real_config_is_placeholder(self):
         # 実物の config.json はロール名がまだ仮なので、はっきりエラーになること
         config = json.loads((br.ROOT / "config.json").read_text(encoding="utf-8"))

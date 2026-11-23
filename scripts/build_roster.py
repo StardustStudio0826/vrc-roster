@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -39,6 +40,10 @@ WORLD_ID_RE = re.compile(
     r"^wrld_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
 PHOTO_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+PHOTO_FORMATS = ["PNG", "JPEG", "WEBP"]   # 中身がこの 3 つ以外の画像は開かない（拡張子ではなく中身で判定）
+PHOTO_MAX_BYTES = 20 * 1024 * 1024       # 元の写真のファイルの大きさの上限
+PHOTO_MAX_PIXELS = 40_000_000            # 元の写真の画素数の上限（展開すると巨大になる画像を弾く）
+IN_CI = os.environ.get("GITHUB_ACTIONS") == "true"   # 公開の実行記録に出る場かどうか
 
 
 class RosterError(Exception):
@@ -212,6 +217,9 @@ def check_override(uid: str, ov: dict, config: dict, data: dict, warnings: list[
     返す dict: slot（名簿に載る）・portal（名簿に載る）・photo / version（写真の処理用・名簿には載らない）
     """
     out: dict = {}
+    if not isinstance(ov, dict):
+        warnings.append("overrides.json に、書き方が崩れている人がいます（{ } で囲んだ形にしてください）")
+        return out
     slots = int(config.get("photo_slots", 0))
     if "photo" in ov:
         photo = ov["photo"]
@@ -246,10 +254,11 @@ def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, di
     ov_all: dict = data.get("overrides", {})
 
     stats = {"subscribers": 0, "panel": 0, "hidden": 0, "no_nick": 0,
-             "duplicates": 0, "unused_overrides": 0, "albums": 0, "slots_used": 0}
+             "duplicates": 0, "unused_overrides": 0, "albums": 0, "slots_used": 0,
+             "bad_name": 0, "bad_photos": 0}
     warnings: list[str] = []
 
-    by_key: dict[str, dict] = {}
+    groups: dict[str, list[dict]] = {}
     seen_uids: set[str] = set()
     for m in guild["members"]:
         user = m.get("user") or {}
@@ -263,21 +272,49 @@ def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, di
         if not name:
             stats["no_nick"] += 1
             continue
+        if any(unicodedata.category(c) in ("Cc", "Cf") for c in name):
+            # 改行・見えない文字入りの名前は載せない（パネルの表示崩しや、見た目が同じ別の名前を防ぐ）
+            stats["bad_name"] += 1
+            continue
         seen_uids.add(uid)
         hidden = optout_id is not None and optout_id in m.get("roles", [])
         extra = check_override(uid, ov_all[uid], config, data, warnings) if uid in ov_all else {}
 
-        key = normalize_name(name)
-        if key in by_key:
-            # 同じ名前が 2 人以上。プランは高い方、載せない指定はどちらかにあれば優先。
-            stats["duplicates"] += 1
-            prev = by_key[key]
-            prev["plan"] = max(prev["plan"], plan)
-            prev["hidden"] = prev["hidden"] or hidden
-            continue
-        by_key[key] = {"name": name, "plan": plan, "hidden": hidden, "uid": uid, "extra": extra}
+        groups.setdefault(normalize_name(name), []).append(
+            {"name": name, "plan": plan, "hidden": hidden, "uid": uid, "extra": extra})
 
     stats["unused_overrides"] = sum(1 for uid in ov_all if uid not in seen_uids)
+
+    # 写真（本人用リンク）は Discord の ID ごとに作る。名前が重なっても、他人の写真は消えない。
+    albums: list[dict] = []
+    by_key: dict[str, dict] = {}
+    for key, entries in groups.items():
+        for e in entries:
+            if "photo" in e["extra"]:
+                albums.append({"uid": e["uid"], "photo": e["extra"]["photo"],
+                               "version": e["extra"]["version"], "slot": None})
+        if len(entries) == 1:
+            e = entries[0]
+            by_key[key] = {"name": e["name"], "plan": e["plan"], "hidden": e["hidden"],
+                           "uid": e["uid"], "extra": dict(e["extra"])}
+            continue
+        # 同じ名前が 2 人以上（他人の名前をニックネームにした人がいるかもしれない）。
+        # ワールドは名前でしか見分けられないので、取り違えが害にならない方に倒す:
+        # プランは高い方・「載せない」はどちらかにあれば優先・枠とポータルは、
+        # 設定を持つ人が 1 人だけのときだけ使う（2 人以上が持っていたら、どちらも使わない）。
+        stats["duplicates"] += len(entries) - 1
+        owners = [e for e in entries if "slot" in e["extra"] or "portal" in e["extra"]]
+        if len(owners) == 1:
+            extra = {k: v for k, v in owners[0]["extra"].items() if k in ("slot", "portal")}
+            owner_uid = owners[0]["uid"]
+        else:
+            extra, owner_uid = {}, ""
+        by_key[key] = {"name": entries[0]["name"], "plan": max(e["plan"] for e in entries),
+                       "hidden": any(e["hidden"] for e in entries),
+                       "uid": owner_uid, "extra": extra}
+    if stats["duplicates"]:
+        warnings.append("同じ名前の契約者が複数います。他人の名前を使っていないか Discord で確かめてください"
+                        "（重なっている間、枠とポータルは設定を持つ人が 1 人のときだけ有効です）")
 
     # 枠の重なりを確かめる（名前順で先の人を残す）
     used_slots: set[int] = set()
@@ -291,14 +328,16 @@ def build_members(guild: dict, config: dict, data: dict) -> tuple[list, list, di
         else:
             used_slots.add(slot)
 
-    shown, hidden_list, albums = [], [], []
+    slot_of_uid = {e["uid"]: e["extra"]["slot"] for e in by_key.values()
+                   if e["uid"] and "slot" in e["extra"]}
+    for a in albums:
+        a["slot"] = slot_of_uid.get(a["uid"])
+
+    shown, hidden_list = [], []
     for e in by_key.values():
         stats["subscribers"] += 1
         ex = e["extra"]
         public = {k: ex[k] for k in ("slot", "portal") if k in ex}
-        if "photo" in ex:
-            albums.append({"uid": e["uid"], "photo": ex["photo"], "version": ex["version"],
-                           "slot": ex.get("slot")})
         if e["hidden"]:
             stats["hidden"] += 1
             hidden_list.append({"hash": name_hash(e["name"]), "plan": e["plan"], **public})
@@ -320,7 +359,12 @@ def make_photo(src: Path, dst: Path, max_px: int) -> None:
     """向きを直し、写真の付加情報（撮影場所など）を消し、長い辺を max_px 以下にして JPG で保存。"""
     from PIL import Image, ImageOps  # 写真を扱うときだけ使う
 
-    with Image.open(src) as im:
+    if src.stat().st_size > PHOTO_MAX_BYTES:
+        raise ValueError("写真のファイルが大きすぎます")
+    Image.MAX_IMAGE_PIXELS = PHOTO_MAX_PIXELS
+    with Image.open(src, formats=PHOTO_FORMATS) as im:
+        if im.width * im.height > PHOTO_MAX_PIXELS:
+            raise ValueError("写真の画素数が大きすぎます")
         im = ImageOps.exif_transpose(im)
         if im.mode in ("RGBA", "LA", "P"):
             im = im.convert("RGBA")
@@ -334,14 +378,25 @@ def make_photo(src: Path, dst: Path, max_px: int) -> None:
         im.save(dst, "JPEG", quality=88, optimize=True)  # exif を渡さない = 付加情報は残らない
 
 
-def publish_photos(albums: list, data: dict, config: dict, site: Path) -> str:
-    """アルバムと枠の画像を site/ に書き、中身の目印（rev）を返す。"""
+def publish_photos(albums: list, data: dict, config: dict, site: Path, stats: dict) -> str:
+    """アルバムと枠の画像を site/ に書き、中身の目印（rev）を返す。
+
+    読めない写真は 1 枚ずつ飛ばす（1 枚のせいで名簿全体が止まらないように）。
+    公開の実行記録にはファイル名を出さない（名前が入っていることがあるため）。
+    """
     max_px = int(config.get("photo_max_px", 1024))
     digest = hashlib.sha256()
     for a in sorted(albums, key=lambda x: album_link_name(data["secret"], x["uid"], x["version"])):
         link = album_link_name(data["secret"], a["uid"], a["version"])
         album_path = site / "a" / f"{link}.jpg"
-        make_photo(data["photos_dir"] / a["photo"], album_path, max_px)
+        try:
+            make_photo(data["photos_dir"] / a["photo"], album_path, max_px)
+        except Exception as e:  # 壊れた画像・対応していない形式・大きすぎる画像など
+            stats["bad_photos"] += 1
+            album_path.unlink(missing_ok=True)
+            if not IN_CI:
+                print(f"読めない写真: {a['photo']}（{type(e).__name__}: {e}）", file=sys.stderr)
+            continue
         body = album_path.read_bytes()
         digest.update(b"a/" + link.encode() + b"\0" + body)
         if a["slot"] is not None:
@@ -394,6 +449,8 @@ def report(stats: dict, changed: bool) -> str:
         f"契約者 {stats['subscribers']} 人（パネルに載る {stats['panel']}・載せない {stats['hidden']}）",
         f"写真のある人 {stats['albums']}・使っている枠 {stats['slots_used']}",
         f"ニックネーム未設定で載せなかった人: {stats['no_nick']}",
+        f"見えない文字が入った名前で載せなかった人: {stats['bad_name']}",
+        f"読めなくて飛ばした写真: {stats['bad_photos']}",
         f"名前が重なった人: {stats['duplicates']}",
         f"契約していない人への手直し（無視）: {stats['unused_overrides']}",
         "名簿: " + ("更新しました" if changed else "変わりなし"),
@@ -457,7 +514,7 @@ def main(argv: list[str] | None = None) -> int:
 
         members, albums, stats = build_members(guild, config, data)
         site = Path(args.site)
-        rev = publish_photos(albums, data, config, site) if albums else ""
+        rev = publish_photos(albums, data, config, site, stats) if albums else ""
         if args.previous_file:
             p_path = Path(args.previous_file)
             previous = json.loads(p_path.read_text(encoding="utf-8")) if p_path.is_file() else None
@@ -476,6 +533,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except json.JSONDecodeError as e:
         text = f"JSON の書き方が崩れています（{e.msg}・{e.lineno} 行目）。config.json か overrides.json を確かめてください。"
+        print(text, file=sys.stderr)
+        _summary(text)
+        return 1
+    except Exception as e:
+        # 想定外のエラー。公開の実行記録には種類だけ出す（詳しい中身に名前やパスが混ざることがあるため）。
+        if not IN_CI:
+            raise
+        text = f"名簿を作れませんでした: 想定外のエラー（{type(e).__name__}）。手元で同じコマンドを動かすと詳しく見られます。"
         print(text, file=sys.stderr)
         _summary(text)
         return 1
